@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+# Guarded shell wrapper for OpenClaw exec commands.
+# Usage:
+#   openclaw-guarded-shell -lc "<command>"
+
+if [[ "$1" == "-lc" || "$1" == "-c" ]]; then
+    shift
+fi
+
+CMD="$*"
+
+exec "/home/richardsun/.openclaw/workspace/defense/safe_exec.py" "$CMD"

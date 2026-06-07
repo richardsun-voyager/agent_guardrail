@@ -1,0 +1,15 @@
+{
+  "id": "before-tool-guard",
+  "name": "Before Tool Guard",
+  "version": "0.1.0",
+  "description": "Blocks or escalates risky tool calls by consulting a local Python guard service.",
+  "activation": {
+    "onStartup": true,
+    "onCapabilities": ["hook"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {}
+  }
+}
