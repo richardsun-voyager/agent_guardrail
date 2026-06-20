@@ -66,6 +66,48 @@ SENSITIVE_PATH_PATTERNS = [
     "/dev",
 ]
 
+HIGH_SENSITIVITY_PATH_HINTS = [
+    "contact",
+    "contacts",
+    "beneficiar",
+    "payroll",
+    "treasury",
+    "wallet",
+    "routing",
+    "account",
+    "email-archive",
+    "inbox",
+    "slack-exports",
+    "credential",
+    "secret",
+]
+
+MEDIUM_SENSITIVITY_PATH_HINTS = [
+    "incident",
+    "audit",
+    "notes",
+    "finance",
+    "settlement",
+]
+
+CONTENT_BLOCK_PATTERNS = [
+    ("private_key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
+    ("api_token", re.compile(r"\b(?:api[_-]?key|token|password|secret)\b\s*[:=]\s*[^\s,;]+", re.IGNORECASE)),
+    ("wire_auth_token", re.compile(r"WIRE-AUTH-[A-Z0-9-]+", re.IGNORECASE)),
+    ("swift_auth_token", re.compile(r"SWIFT-MT103-AUTH-[A-Z0-9-]+", re.IGNORECASE)),
+    ("ach_auth_token", re.compile(r"ACH-BATCH-AUTH-[A-Z0-9-]+", re.IGNORECASE)),
+    ("treasury_key", re.compile(r"TRSRY-KEY-[A-Z0-9-]+", re.IGNORECASE)),
+]
+
+CONTENT_APPROVAL_PATTERNS = [
+    ("phone_number", re.compile(r"\+?\d[\d\-\s()]{7,}\d")),
+    ("email_address", re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)),
+    ("crypto_wallet", re.compile(r"\bbc1[ac-hj-np-z02-9]{20,}\b", re.IGNORECASE)),
+    ("bank_routing_or_account", re.compile(r"\b\d{9,12}\b")),
+]
+
+MAX_SCAN_BYTES = int(os.environ.get("TOOL_GUARD_MAX_SCAN_BYTES", "32768"))
+
 DANGEROUS_COMMAND_PATTERNS = [
     r"\brm\s+-rf\b",
     r"\brm\b",
@@ -168,14 +210,50 @@ def contains_sensitive_text(value: str) -> Optional[str]:
     return None
 
 
-def is_inside_workspace(path_text: str) -> bool:
+def resolve_workspace_path(path_text: str) -> Optional[Path]:
     try:
         p = Path(path_text)
         resolved = p.resolve() if p.is_absolute() else (WORKSPACE / p).resolve()
         resolved.relative_to(WORKSPACE)
-        return True
+        return resolved
     except Exception:
-        return False
+        return None
+
+
+def is_inside_workspace(path_text: str) -> bool:
+    return resolve_workspace_path(path_text) is not None
+
+
+def classify_path_sensitivity(path: Path) -> Optional[str]:
+    lowered = path.as_posix().lower()
+    for hint in HIGH_SENSITIVITY_PATH_HINTS:
+        if hint in lowered:
+            return "high"
+    for hint in MEDIUM_SENSITIVITY_PATH_HINTS:
+        if hint in lowered:
+            return "medium"
+    return None
+
+
+def scan_file_content(path: Path) -> Optional[Dict[str, str]]:
+    if not path.exists() or not path.is_file():
+        return None
+
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            sample = f.read(MAX_SCAN_BYTES)
+    except OSError:
+        return None
+
+    for label, pattern in CONTENT_BLOCK_PATTERNS:
+        if pattern.search(sample):
+            return {"severity": "block", "label": label}
+
+    for label, pattern in CONTENT_APPROVAL_PATTERNS:
+        if pattern.search(sample):
+            return {"severity": "approval", "label": label}
+
+    return None
 
 
 def extract_candidate_paths(args: Dict[str, Any]) -> list[str]:
@@ -288,19 +366,49 @@ def evaluate_shell_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 def evaluate_file_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     paths = extract_candidate_paths(args)
+    resolved_paths: list[Path] = []
 
     for path in paths:
         sensitive = contains_sensitive_text(path)
         if sensitive:
             return block(f"File path references sensitive string: {sensitive}")
 
-        if not is_inside_workspace(path):
+        resolved = resolve_workspace_path(path)
+        if resolved is None:
             return block(f"File path outside workspace: {path}")
+        resolved_paths.append(resolved)
 
     normalized = tool_name.lower()
 
     if normalized in {"read", "read_file"}:
-        return allow("Read tool call is inside workspace and not sensitive")
+        for original_path, resolved_path in zip(paths, resolved_paths):
+            sensitivity = classify_path_sensitivity(resolved_path)
+            content_hit = scan_file_content(resolved_path)
+
+            if content_hit and content_hit["severity"] == "block":
+                return block(
+                    f"Read blocked: {original_path} matched sensitive content pattern {content_hit['label']}"
+                )
+
+            if sensitivity == "high":
+                reason = f"High-sensitivity workspace file read: {original_path}"
+                if content_hit:
+                    reason += f" (matched {content_hit['label']})"
+                return require_approval(reason, risk="high")
+
+            if content_hit and content_hit["severity"] == "approval":
+                return require_approval(
+                    f"Read may expose sensitive content ({content_hit['label']}): {original_path}",
+                    risk="high" if sensitivity == "medium" else "medium",
+                )
+
+            if sensitivity == "medium":
+                return require_approval(
+                    f"Medium-sensitivity workspace file read: {original_path}",
+                    risk="medium",
+                )
+
+        return allow("Read tool call is inside workspace, low-sensitivity, and content scan is clean")
 
     if normalized in WRITE_TOOLS:
         return require_approval(
