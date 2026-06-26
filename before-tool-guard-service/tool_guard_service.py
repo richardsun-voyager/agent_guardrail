@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -179,6 +180,31 @@ SHELL_TOOLS = {
     "bash",
 }
 
+LOW_RISK_SHELL_COMMANDS = {
+    "date",
+    "echo",
+    "git",
+    "ls",
+    "node",
+    "npm",
+    "pip",
+    "pip3",
+    "pwd",
+    "python",
+    "python3",
+    "uname",
+    "whoami",
+}
+
+READ_ONLY_SHELL_COMMANDS = {
+    "cat",
+    "find",
+    "grep",
+    "head",
+    "tail",
+    "wc",
+}
+
 
 # ---------------------------------------------------------------------
 # Logging helpers
@@ -254,6 +280,15 @@ def scan_file_content(path: Path) -> Optional[Dict[str, str]]:
             return {"severity": "approval", "label": label}
 
     return None
+
+
+def shell_paths_are_inside_workspace(parts: list[str]) -> bool:
+    for part in parts:
+        if part.startswith("-"):
+            continue
+        if resolve_workspace_path(part) is None:
+            return False
+    return True
 
 
 def extract_candidate_paths(args: Dict[str, Any]) -> list[str]:
@@ -354,9 +389,29 @@ def evaluate_shell_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         if token in command:
             return block(f"Forbidden shell metacharacter: {token}")
 
-    first_word = command.strip().split()[0]
-    if first_word in {"ls", "pwd", "cat", "head", "tail", "grep", "find", "wc"}:
+    try:
+        parts = shlex.split(command)
+    except ValueError as exc:
+        return block(f"Invalid shell command syntax: {exc}")
+
+    if not parts:
+        return block("Shell tool call has no command")
+
+    first_word = parts[0]
+    command_args = parts[1:]
+
+    if first_word in LOW_RISK_SHELL_COMMANDS:
         return allow("Read-only shell command appears low risk")
+
+    if first_word in READ_ONLY_SHELL_COMMANDS:
+        return allow("Read-only shell command appears low risk")
+
+    if first_word == "mkdir":
+        if not command_args:
+            return block("mkdir requires at least one path")
+        if shell_paths_are_inside_workspace(command_args):
+            return allow("mkdir creates directories inside workspace")
+        return block("mkdir path outside workspace")
 
     return require_approval(
         f"Shell command requires human approval: {first_word}",
