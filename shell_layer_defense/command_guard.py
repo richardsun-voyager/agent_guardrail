@@ -78,9 +78,8 @@ ALLOWED_PREFIXES = [
     "head",
     "tail",
     "cat",
-    "python",
-    "python3",
-    "pytest",
+    # python/python3/pytest deliberately excluded: bare prefix-matching can't
+    # validate -c/-m payloads, so they fall through to REQUIRE_APPROVAL instead.
     "pip show",
     "pip list",
     "git status",

@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -546,6 +547,13 @@ def post_approval_response(
 def register(ctx: Any) -> None:
     """Hermes plugin entry point."""
     _ensure_dirs()
+    if ALLOW_APPROVAL_CLASS:
+        warning = (
+            f"[{PLUGIN_NAME}] WARNING: HERMES_TOOL_GUARD_ALLOW_APPROVAL is enabled; "
+            "approval-required decisions will execute automatically instead of pausing."
+        )
+        print(warning, file=sys.stderr)
+        _log({"hook": "register", "level": "warning", "message": warning})
     ctx.register_hook("pre_tool_call", before_tool_call)
     ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_hook("pre_approval_request", pre_approval_request)

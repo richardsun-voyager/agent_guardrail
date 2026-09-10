@@ -147,7 +147,7 @@ Optional environment variables:
 |---|---:|---|
 | `HERMES_TOOL_GUARD_DIR` | `~/.hermes/tool_guard` | Runtime log and pending-approval directory. |
 | `HERMES_TOOL_GUARD_FAIL_CLOSED` | `1` | If `1`, internal plugin errors block the tool call. |
-| `HERMES_TOOL_GUARD_ALLOW_APPROVAL` | `0` | If `1`, approval-class decisions are allowed. Use only for debugging. |
+| `HERMES_TOOL_GUARD_ALLOW_APPROVAL` | `0` | If `1`, approval-class decisions are allowed. Use only for debugging; the plugin logs a warning to stderr and the audit log on every `register()` while this is active. |
 | `HERMES_TOOL_GUARD_EXTRA_SENSITIVE_PATHS` | empty | Comma-separated extra sensitive path fragments. |
 
 Example:
@@ -164,7 +164,7 @@ export HERMES_TOOL_GUARD_EXTRA_SENSITIVE_PATHS=".aws/credentials,.npmrc,prod.yam
 
 3. **Tool names may vary by Hermes version or plugin.** The plugin covers common names such as `terminal`, `write_file`, `patch`, `read_file`, `web_search`, and `http_request`. Add your local tool names to `TERMINAL_TOOLS`, `FILE_WRITE_TOOLS`, `FILE_READ_TOOLS`, or `NETWORK_TOOLS` in `__init__.py` if needed.
 
-4. **Fail-closed can interrupt normal work.** This is intentional for safety experiments. Set `HERMES_TOOL_GUARD_FAIL_CLOSED=0` only while debugging.
+5. **`HERMES_TOOL_GUARD_ALLOW_APPROVAL=1` degrades protection silently unless you watch for it.** Every plugin `register()` call emits a stderr warning and an `audit.jsonl` entry (`"hook": "register", "level": "warning"`) while this is enabled, so it isn't left on unnoticed in a config copied from a debugging session.
 
 ## How to modify policy
 

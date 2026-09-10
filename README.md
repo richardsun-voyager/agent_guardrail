@@ -13,6 +13,44 @@ agent_guardrail/
 └── shell_layer_defense/
 ```
 
+## v1.1 policy controls
+
+The Python guard adds four architecture-preserving controls:
+
+- command/subcommand policy, so approval is based on the actual operation
+  (`git status` versus `git push`) rather than only the executable name;
+- a workspace boundary invariant across known and unknown tool schemas, with
+  canonical path and symlink resolution;
+- outbound destination classification, including an HTTPS hostname allowlist,
+  known exfiltration endpoints, URL credentials, localhost, and non-global IPs;
+- a bounded per-session risk score that escalates repeated risky actions and
+  decays over time.
+
+Hard policy blocks remain blocks regardless of the session score. Calls without
+a session ID are evaluated normally but do not share trajectory state.
+
+Configure trusted outbound hosts and trajectory thresholds before starting the
+sidecar:
+
+``` bash
+export TOOL_GUARD_TRUSTED_DESTINATIONS="api.example.com,docs.example.com"
+export TOOL_GUARD_SESSION_APPROVAL_THRESHOLD=4
+export TOOL_GUARD_SESSION_BLOCK_THRESHOLD=8
+export TOOL_GUARD_SESSION_RISK_DECAY_SECONDS=300
+export TOOL_GUARD_SESSION_RISK_TTL_SECONDS=1800
+export TOOL_GUARD_SESSION_RISK_MAX_SESSIONS=10000
+```
+
+Only HTTPS requests to an exact allowlisted hostname or its subdomains are
+automatically allowed. Read requests to other public destinations require
+approval; unsafe destinations and known exfiltration endpoints are blocked.
+
+Run the policy regression tests with:
+
+``` bash
+python3 -m unittest discover -s before-tool-guard-service -p 'test_*.py' -v
+```
+
 > **Important:** OpenClaw and Hermes use different installation models.\
 > On OpenClaw, the guard consists of a Python sidecar service **plus**
 > an OpenClaw plugin.\

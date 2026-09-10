@@ -18,7 +18,7 @@ For OpenClaw, the intended flow is:
 - `openclaw-guarded-shell-0`: tiny shell adapter that accepts `-c` or `-lc` and forwards the command into the Python guard.
 - `safe_exec_enhanced.py`: earlier guarded executor variant with a simpler allow/block model.
 - `safe_exec.py`: minimal allowlist-based version.
-- `command_guard.py`: regex-first prototype that returns allow, block, or approval-required decisions.
+- `command_guard.py`: regex-first prototype that returns allow, block, or approval-required decisions. `python`/`python3`/`pytest` are intentionally left off its allowlist so bare interpreter invocations (e.g. `python3 -c "..."`) fall through to `REQUIRE_APPROVAL` instead of being auto-allowed.
 - `logs/defense_audit.jsonl`: append-only audit log.
 - `logs/pending_approvals.jsonl`: append-only approval queue and approval status updates.
 

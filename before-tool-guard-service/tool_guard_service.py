@@ -16,13 +16,20 @@ Default endpoint:
   POST http://127.0.0.1:8765/evaluate_tool_call
 
 Environment variables:
-  TOOL_GUARD_HOST       default: 127.0.0.1
-  TOOL_GUARD_PORT       default: 8765
-  TOOL_GUARD_WORKSPACE  default: /home/richardsun/.openclaw/workspace
+  TOOL_GUARD_HOST                         default: 127.0.0.1
+  TOOL_GUARD_PORT                         default: 8765
+  TOOL_GUARD_WORKSPACE                    default: ~/.openclaw/workspace
+  TOOL_GUARD_TRUSTED_DESTINATIONS         comma-separated host allowlist
+  TOOL_GUARD_SESSION_APPROVAL_THRESHOLD   default: 4
+  TOOL_GUARD_SESSION_BLOCK_THRESHOLD      default: 8
+  TOOL_GUARD_SESSION_RISK_DECAY_SECONDS   default: 300
+  TOOL_GUARD_SESSION_RISK_TTL_SECONDS     default: 1800
+  TOOL_GUARD_SESSION_RISK_MAX_SESSIONS    default: 10000
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -32,6 +39,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 
 # ---------------------------------------------------------------------
@@ -39,7 +47,9 @@ from typing import Any, Dict, Optional
 # ---------------------------------------------------------------------
 
 WORKSPACE = Path(
-    os.environ.get("TOOL_GUARD_WORKSPACE", "/home/richardsun/.openclaw/workspace")
+    os.environ.get(
+        "TOOL_GUARD_WORKSPACE", str(Path.home() / ".openclaw" / "workspace")
+    )
 ).resolve()
 
 DEFENSE_DIR = WORKSPACE / "defense"
@@ -108,6 +118,30 @@ CONTENT_APPROVAL_PATTERNS = [
 ]
 
 MAX_SCAN_BYTES = int(os.environ.get("TOOL_GUARD_MAX_SCAN_BYTES", "32768"))
+
+TRUSTED_DESTINATIONS = {
+    host.strip().lower().rstrip(".")
+    for host in os.environ.get("TOOL_GUARD_TRUSTED_DESTINATIONS", "").split(",")
+    if host.strip()
+}
+
+SESSION_RISK_APPROVAL_THRESHOLD = max(
+    1, int(os.environ.get("TOOL_GUARD_SESSION_APPROVAL_THRESHOLD", "4"))
+)
+SESSION_RISK_BLOCK_THRESHOLD = max(
+    SESSION_RISK_APPROVAL_THRESHOLD + 1,
+    int(os.environ.get("TOOL_GUARD_SESSION_BLOCK_THRESHOLD", "8")),
+)
+SESSION_RISK_DECAY_SECONDS = max(
+    1, int(os.environ.get("TOOL_GUARD_SESSION_RISK_DECAY_SECONDS", "300"))
+)
+SESSION_RISK_TTL_SECONDS = max(
+    SESSION_RISK_DECAY_SECONDS,
+    int(os.environ.get("TOOL_GUARD_SESSION_RISK_TTL_SECONDS", "1800")),
+)
+SESSION_RISK_MAX_SESSIONS = max(
+    1, int(os.environ.get("TOOL_GUARD_SESSION_RISK_MAX_SESSIONS", "10000"))
+)
 
 DANGEROUS_COMMAND_PATTERNS = [
     r"\brm\s+-rf\b",
@@ -183,15 +217,8 @@ SHELL_TOOLS = {
 LOW_RISK_SHELL_COMMANDS = {
     "date",
     "echo",
-    "git",
     "ls",
-    "node",
-    "npm",
-    "pip",
-    "pip3",
     "pwd",
-    "python",
-    "python3",
     "uname",
     "whoami",
 }
@@ -204,6 +231,32 @@ READ_ONLY_SHELL_COMMANDS = {
     "tail",
     "wc",
 }
+
+COMMAND_SUBCOMMAND_POLICY = {
+    "git": {
+        "allow": {"status", "diff", "log", "show", "rev-parse"},
+        "block": {"clean"},
+    },
+    "npm": {"allow": {"view", "search"}, "block": set()},
+    "pip": {"allow": {"show", "list", "freeze", "check"}, "block": set()},
+    "pip3": {"allow": {"show", "list", "freeze", "check"}, "block": set()},
+}
+
+PATH_OPERAND_COMMANDS = READ_ONLY_SHELL_COMMANDS | {"ls", "mkdir"}
+URL_KEYS = {
+    "url",
+    "uri",
+    "endpoint",
+    "base_url",
+    "destination",
+    "destination_url",
+    "webhook_url",
+    "callback_url",
+    "host",
+}
+
+# Process-local trajectory state. Scores are bounded, decay, and eventually expire.
+SESSION_RISK: Dict[str, Dict[str, float]] = {}
 
 
 # ---------------------------------------------------------------------
@@ -291,6 +344,38 @@ def shell_paths_are_inside_workspace(parts: list[str]) -> bool:
     return True
 
 
+def shell_path_operands(parts: list[str]) -> list[str]:
+    """Return path operands for commands whose positional arguments are paths."""
+    operands: list[str] = []
+    skip_next = False
+    for part in parts:
+        if skip_next:
+            skip_next = False
+            continue
+        if part in {"-C", "--directory", "--exclude", "-e"}:
+            skip_next = True
+            continue
+        if not part.startswith("-"):
+            operands.append(part)
+    return operands
+
+
+def option_paths(parts: list[str], option_names: set[str]) -> list[str]:
+    """Extract path values from `--option value` and `--option=value`."""
+    paths: list[str] = []
+    for index, part in enumerate(parts):
+        if part in option_names and index + 1 < len(parts):
+            paths.append(parts[index + 1])
+            continue
+        for name in option_names:
+            prefix = f"{name}="
+            if part.startswith(prefix):
+                paths.append(part[len(prefix):])
+            elif len(name) == 2 and part.startswith(name) and part != name:
+                paths.append(part[len(name):])
+    return paths
+
+
 def extract_candidate_paths(args: Dict[str, Any]) -> list[str]:
     """
     Extract likely file paths from arbitrary tool arguments.
@@ -307,6 +392,12 @@ def extract_candidate_paths(args: Dict[str, Any]) -> list[str]:
         "destination",
         "src",
         "dst",
+        "cwd",
+        "workdir",
+        "working_directory",
+        "directory",
+        "root",
+        "output_path",
     }
 
     paths: list[str] = []
@@ -322,11 +413,77 @@ def extract_candidate_paths(args: Dict[str, Any]) -> list[str]:
             for item in obj:
                 walk(item, key_hint=key_hint)
         elif isinstance(obj, str):
-            if key_hint in path_keys:
+            if key_hint in path_keys and not looks_like_url(obj):
                 paths.append(obj)
 
     walk(args)
     return paths
+
+
+def looks_like_url(value: str) -> bool:
+    try:
+        return urlparse(value).scheme.lower() in {"http", "https"}
+    except ValueError:
+        return False
+
+
+def extract_destinations(args: Dict[str, Any]) -> list[str]:
+    destinations: list[str] = []
+
+    def walk(obj: Any, key_hint: Optional[str] = None) -> None:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                walk(value, key.lower())
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item, key_hint)
+        elif isinstance(obj, str) and (key_hint in URL_KEYS or looks_like_url(obj)):
+            destinations.append(obj)
+
+    walk(args)
+    return destinations
+
+
+def classify_destination(destination: str) -> tuple[str, str]:
+    """Classify a destination as trusted, untrusted, or blocked."""
+    try:
+        value = destination if "://" in destination else f"https://{destination}"
+        parsed = urlparse(value)
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return "blocked", "Malformed network destination"
+
+    if scheme not in {"http", "https"} or not hostname:
+        return "blocked", "Only explicit HTTP(S) destinations are permitted"
+    if parsed.username or parsed.password:
+        return "blocked", "Credentials embedded in destination URL"
+    if any(domain in destination.lower() for domain in EXFIL_DOMAINS):
+        return "blocked", "Known exfiltration/webhook destination"
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return "blocked", "Loopback destination is not trusted"
+
+    try:
+        address = ipaddress.ip_address(hostname)
+        if not address.is_global:
+            return "blocked", "Private or non-global IP destination"
+    except ValueError:
+        pass
+
+    try:
+        port = parsed.port
+    except ValueError:
+        return "blocked", "Malformed network destination port"
+
+    trusted = any(
+        hostname == domain or hostname.endswith(f".{domain}")
+        for domain in TRUSTED_DESTINATIONS
+    )
+    if trusted and scheme == "https" and port in {None, 443}:
+        return "trusted", "Destination is allowlisted"
+    if trusted:
+        return "untrusted", "Allowlisted host uses an untrusted scheme or port"
+    return "untrusted", "Destination is not allowlisted"
 
 
 def serialize_args(args: Dict[str, Any]) -> str:
@@ -350,20 +507,64 @@ def block(reason: str) -> Dict[str, Any]:
 
 def require_approval(reason: str, risk: str = "medium") -> Dict[str, Any]:
     approval_id = uuid.uuid4().hex[:16]
-    record = {
-        "approval_id": approval_id,
-        "status": "pending",
-        "risk": risk,
-        "reason": reason,
-        "timestamp": now_ts(),
-    }
-    write_jsonl(PENDING_APPROVAL_PATH, record)
     return {
         "decision": "approval_required",
         "approval_id": approval_id,
         "risk": risk,
         "reason": reason,
     }
+
+
+def apply_session_risk(
+    decision: Dict[str, Any], session_id: Any
+) -> Dict[str, Any]:
+    """Accumulate bounded risk and escalate otherwise-permitted trajectories."""
+    if not session_id:
+        return decision
+
+    key = str(session_id)
+    now = now_ts()
+    if key not in SESSION_RISK and len(SESSION_RISK) >= SESSION_RISK_MAX_SESSIONS:
+        expired = [
+            session
+            for session, item in SESSION_RISK.items()
+            if now - item["updated"] >= SESSION_RISK_TTL_SECONDS
+        ]
+        for session in expired:
+            SESSION_RISK.pop(session, None)
+        if len(SESSION_RISK) >= SESSION_RISK_MAX_SESSIONS:
+            oldest = min(
+                SESSION_RISK,
+                key=lambda session: SESSION_RISK[session]["updated"],
+            )
+            SESSION_RISK.pop(oldest)
+
+    state = SESSION_RISK.get(key, {"score": 0.0, "updated": now})
+    elapsed = max(0.0, now - state["updated"])
+    if elapsed >= SESSION_RISK_TTL_SECONDS:
+        score = 0
+    else:
+        score = max(
+            0,
+            int(state["score"]) - int(elapsed // SESSION_RISK_DECAY_SECONDS),
+        )
+
+    risk = str(decision.get("risk", "low"))
+    increment = {"low": 0, "medium": 2, "high": 3}.get(risk, 1)
+    if decision["decision"] == "block":
+        increment = max(increment, 4)
+    score = min(SESSION_RISK_BLOCK_THRESHOLD, score + increment)
+    SESSION_RISK[key] = {"score": float(score), "updated": now}
+
+    if decision["decision"] != "block" and score >= SESSION_RISK_BLOCK_THRESHOLD:
+        decision = block("Session risk threshold exceeded")
+    elif decision["decision"] == "allow" and score >= SESSION_RISK_APPROVAL_THRESHOLD:
+        decision = require_approval(
+            "Accumulated session risk requires approval", risk="high"
+        )
+
+    decision["session_risk_score"] = score
+    return decision
 
 
 # ---------------------------------------------------------------------
@@ -400,6 +601,21 @@ def evaluate_shell_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     first_word = parts[0]
     command_args = parts[1:]
 
+    option_assigned_paths = [
+        part.split("=", 1)[1]
+        for part in command_args
+        if part.startswith("-")
+        and "=" in part
+        and part.split("=", 1)[1].startswith(("/", "./", "../", "~"))
+    ]
+    if not shell_paths_are_inside_workspace(option_assigned_paths):
+        return block(f"{first_word} option path outside workspace")
+
+    if first_word in PATH_OPERAND_COMMANDS:
+        operands = shell_path_operands(command_args)
+        if operands and not shell_paths_are_inside_workspace(operands):
+            return block(f"{first_word} path outside workspace")
+
     if first_word in LOW_RISK_SHELL_COMMANDS:
         return allow("Read-only shell command appears low risk")
 
@@ -413,6 +629,86 @@ def evaluate_shell_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             return allow("mkdir creates directories inside workspace")
         return block("mkdir path outside workspace")
 
+    if first_word in {"curl", "wget"}:
+        output_paths = option_paths(command_args, {"-o", "-O", "--output"})
+        if not shell_paths_are_inside_workspace(output_paths):
+            return block(f"{first_word} output path outside workspace")
+        destinations = [part for part in command_args if looks_like_url(part)]
+        method = "GET"
+        if first_word == "curl":
+            for index, part in enumerate(command_args):
+                if part in {"-X", "--request"} and index + 1 < len(command_args):
+                    method = command_args[index + 1].upper()
+                elif part.startswith("--request="):
+                    method = part.split("=", 1)[1].upper()
+                elif part.startswith("-X") and part != "-X":
+                    method = part[2:].upper()
+                elif part in {"-d", "--data", "--data-raw", "--data-binary"}:
+                    method = "POST"
+                elif part.startswith(("-d", "--data=")):
+                    method = "POST"
+        network_decision = evaluate_network_tool(
+            first_word, {"url": destinations, "method": method}
+        )
+        if network_decision["decision"] != "allow":
+            return network_decision
+        return require_approval(
+            f"Shell network command requires approval: {first_word}", risk="medium"
+        )
+
+    policy = COMMAND_SUBCOMMAND_POLICY.get(first_word)
+    if policy is not None:
+        if first_word == "git":
+            if "--no-index" in command_args:
+                return block("git --no-index can access paths outside the repository")
+            configured_paths = option_paths(
+                command_args, {"-C", "--git-dir", "--work-tree", "--output"}
+            )
+            if not shell_paths_are_inside_workspace(configured_paths):
+                return block("git path option outside workspace")
+            if option_paths(command_args, {"--output"}):
+                return require_approval(
+                    "git output file requires approval", risk="medium"
+                )
+            explicit_paths = [
+                part
+                for part in command_args
+                if part.startswith(("/", "./", "../", "~"))
+            ]
+            if not shell_paths_are_inside_workspace(explicit_paths):
+                return block("git path operand outside workspace")
+        subcommand = next(
+            (
+                part
+                for index, part in enumerate(command_args)
+                if not part.startswith("-")
+                and (
+                    index == 0
+                    or command_args[index - 1]
+                    not in {"-C", "--git-dir", "--work-tree"}
+                )
+            ),
+            "",
+        )
+        if not subcommand:
+            return require_approval(
+                f"{first_word} command has no recognized subcommand"
+            )
+        if subcommand in policy["block"]:
+            return block(f"Blocked command policy: {first_word} {subcommand}")
+        if subcommand in policy["allow"]:
+            return allow(f"Allowed command policy: {first_word} {subcommand}")
+        return require_approval(
+            f"Command policy requires approval: {first_word} {subcommand}",
+            risk="medium",
+        )
+
+    if first_word in {"python", "python3", "node"}:
+        return require_approval(
+            f"Interpreter execution requires human approval: {first_word}",
+            risk="high",
+        )
+
     return require_approval(
         f"Shell command requires human approval: {first_word}",
         risk="medium",
@@ -422,6 +718,9 @@ def evaluate_shell_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
 def evaluate_file_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     paths = extract_candidate_paths(args)
     resolved_paths: list[Path] = []
+
+    if not paths:
+        return block(f"File tool call has no path: {tool_name}")
 
     for path in paths:
         sensitive = contains_sensitive_text(path)
@@ -484,9 +783,17 @@ def evaluate_network_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any
     if sensitive:
         return block(f"Network request appears to include sensitive string: {sensitive}")
 
-    for domain in EXFIL_DOMAINS:
-        if domain.lower() in serialized:
-            return block(f"Known exfiltration/webhook destination: {domain}")
+    destinations = extract_destinations(args)
+    if not destinations:
+        return block("Network tool call has no explicit destination")
+
+    untrusted = False
+    for destination in destinations:
+        trust, reason = classify_destination(destination)
+        if trust == "blocked":
+            return block(f"Blocked network destination: {reason}: {destination}")
+        if trust == "untrusted":
+            untrusted = True
 
     method = str(args.get("method", "GET")).upper()
 
@@ -496,7 +803,12 @@ def evaluate_network_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any
             risk="high",
         )
 
-    return allow("Network request appears read-only")
+    if untrusted:
+        return require_approval(
+            "Read request to an untrusted destination", risk="medium"
+        )
+
+    return allow("Read request targets a trusted destination")
 
 
 def evaluate_unknown_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -540,7 +852,21 @@ def evaluate_tool_call(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     normalized = tool_name.lower()
 
-    if normalized in SHELL_TOOLS:
+    # Enforce the workspace invariant for every tool schema, including plugins
+    # and network tools that also carry local source or destination paths.
+    decision: Optional[Dict[str, Any]] = None
+    for candidate in extract_candidate_paths(args):
+        sensitive = contains_sensitive_text(candidate)
+        if sensitive:
+            decision = block(f"Tool path references sensitive string: {sensitive}")
+            break
+        if not is_inside_workspace(candidate):
+            decision = block(f"Tool path outside workspace: {candidate}")
+            break
+
+    if decision is not None:
+        pass
+    elif normalized in SHELL_TOOLS:
         decision = evaluate_shell_tool(normalized, args)
     elif normalized in WRITE_TOOLS or normalized in {"read", "read_file"}:
         decision = evaluate_file_tool(normalized, args)
@@ -550,6 +876,18 @@ def evaluate_tool_call(payload: Dict[str, Any]) -> Dict[str, Any]:
         decision = allow("Known read-only tool")
     else:
         decision = evaluate_unknown_tool(normalized, args)
+
+    decision = apply_session_risk(decision, payload.get("session_id"))
+
+    if decision["decision"] == "approval_required":
+        write_jsonl(PENDING_APPROVAL_PATH, {
+            "approval_id": decision["approval_id"],
+            "status": "pending",
+            "risk": decision["risk"],
+            "reason": decision["reason"],
+            "timestamp": now_ts(),
+            "session_id": payload.get("session_id"),
+        })
 
     audit({
         "event": "before_tool_call_evaluation",
