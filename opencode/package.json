@@ -1,0 +1,14 @@
+{
+  "name": "opencode-agent-guardrail",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "scripts": {
+    "test": "node test/guard-client.test.js"
+  },
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  }
+}

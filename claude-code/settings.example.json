@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|Read|Write|Edit|Glob|Grep|WebFetch|WebSearch|mcp__.*)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PROJECT_DIR}/claude-code/guard_hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking tool call with Agent Guardrail"
+          }
+        ]
+      }
+    ]
+  }
+}

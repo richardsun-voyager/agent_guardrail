@@ -1,7 +1,7 @@
 # Agent Guardrail
 
 A defense layer for agent tool calls, with separate integrations for
-**OpenClaw** and **Hermes Agent**.
+**OpenClaw**, **Hermes Agent**, **Codex**, **Claude Code**, and **OpenCode**.
 
 This repository currently contains:
 
@@ -10,6 +10,9 @@ agent_guardrail/
 ├── before-tool-guard-service/   # Python policy service used by OpenClaw
 ├── before-tool-guard/           # OpenClaw before_tool_call bridge plugin
 ├── hermes-tool-guard/           # Native Hermes pre_tool_call plugin
+├── codex/                       # Codex PreToolUse plugin
+├── claude-code/                 # Claude Code PreToolUse hook
+├── opencode/                    # OpenCode v2 permission/tool plugin
 └── shell_layer_defense/
 ```
 
@@ -49,6 +52,9 @@ Run the policy regression tests with:
 
 ``` bash
 python3 -m unittest discover -s before-tool-guard-service -p 'test_*.py' -v
+python3 -m unittest codex/test_guard_hook.py -v
+python3 -m unittest claude-code/test_guard_hook.py -v
+node opencode/test/guard-client.test.js
 ```
 
 > **Important:** OpenClaw and Hermes use different installation models.\
